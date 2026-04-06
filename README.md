@@ -79,7 +79,6 @@ If a `ForwardingAddress` is stored as an internal GUID (which Exchange does for 
 |---|---|---|
 | `-Mailbox` | Required | Email address of the mailbox to investigate |
 | `-DaysBack` | Prompted (default 90) | Days back to search. Max 90 standard, 180 with E5 |
-| `-SaveToCsv` | Off | Opens a save dialog to export results |
 | `-OutputCsv` | None | Direct path to save CSV output |
 
 ---
