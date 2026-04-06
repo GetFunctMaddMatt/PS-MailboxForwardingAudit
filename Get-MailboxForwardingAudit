@@ -1,0 +1,265 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    Finds when mailbox forwarding was configured and by whom via the Unified Audit Log.
+.DESCRIPTION
+    Searches Exchange Online audit records for Set-Mailbox operations that touched
+    ForwardingAddress, ForwardingSmtpAddress, or DeliverToMailboxAndForward on the
+    target mailbox.
+
+    Runs two searches per mailbox to catch both GUI-originated and PowerShell-originated
+    changes. GUI changes log the mailbox as an Azure AD Object ID (GUID) rather than
+    an email address — searching by email alone silently misses these records. This
+    script resolves the email to its ExternalDirectoryObjectId and searches both.
+
+    NOTE: Search-MailboxAuditLog and New-MailboxAuditLogSearch were deprecated by
+    Microsoft as of March 2025. This script uses Search-UnifiedAuditLog which is the
+    correct replacement.
+.PARAMETER Mailbox
+    Email address of the mailbox to investigate.
+.PARAMETER DaysBack
+    How many days back to search. Max 90 for standard licensing, 180 for E5.
+    Default: 90.
+.PARAMETER OutputCsv
+    Optional. Path to export results as CSV. If not supplied results are written
+    to the console only.
+.EXAMPLE
+    PS> .\Get-ForwardingAudit.ps1 -Mailbox "user@contoso.com"
+.EXAMPLE
+    PS> .\Get-ForwardingAudit.ps1 -Mailbox "user@contoso.com" -DaysBack 180 -OutputCsv "C:\Temp\ForwardingAudit.csv"
+.NOTES
+    Permissions : View-Only Audit Logs or higher in Exchange Online
+    Read-only   : This script makes no changes. No backups required.
+    Licensing   : Audit log retention is 90 days (standard) or 180 days (E5/Audit Premium)
+#>
+
+param(
+    [Parameter(Mandatory)]
+    [ValidateNotNullOrEmpty()]
+    [string]$Mailbox,
+
+    [Parameter()]
+    [ValidateRange(1, 180)]
+    [int]$DaysBack,
+
+    [Parameter()]
+    [string]$OutputCsv = ''
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$forwardingParams = @(
+    'ForwardingAddress',
+    'ForwardingSmtpAddress',
+    'DeliverToMailboxAndForward'
+)
+
+#region --- Module Check ---
+if (!(Get-Module -ListAvailable -Name ExchangeOnlineManagement)) {
+    Write-Warning "ExchangeOnlineManagement module not installed."
+    $install = Read-Host "Install it? (Y/N)"
+    if ($install -eq 'Y') {
+        Install-Module -Name ExchangeOnlineManagement -Scope CurrentUser -Force
+        Import-Module ExchangeOnlineManagement -ErrorAction Stop
+    } else {
+        Write-Error "ExchangeOnlineManagement is required. Exiting."
+        return
+    }
+} else {
+    Import-Module ExchangeOnlineManagement -ErrorAction Stop
+}
+#endregion
+
+#region --- Connection ---
+$newConnection = $false
+if (-not (Get-ConnectionInformation)) {
+    Write-Output "Connecting to Exchange Online..."
+    Connect-ExchangeOnline -ShowBanner:$false -ErrorAction Stop
+    $newConnection = $true
+}
+
+# Prompt for DaysBack if not supplied
+if (-not $PSBoundParameters.ContainsKey('DaysBack')) {
+    $input = Read-Host "How many days back to search? [default: 90, max: 180]"
+    if ($input.Trim() -eq '') {
+        $DaysBack = 90
+    } else {
+        $DaysBack = [int]$input
+        if ($DaysBack -lt 1 -or $DaysBack -gt 180) {
+            Write-Error "Days must be between 1 and 180."
+            return
+        }
+    }
+}
+#endregion
+
+#region --- Pre-flight Checks ---
+
+# Warn if audit ingestion is off
+$auditStatus = Get-AdminAuditLogConfig |
+    Select-Object -ExpandProperty UnifiedAuditLogIngestionEnabled
+if (-not $auditStatus) {
+    Write-Warning "Unified Audit Log ingestion is DISABLED for this tenant."
+    Write-Warning "Historical forwarding changes may not have been captured."
+    Write-Warning "Enable with: Set-AdminAuditLogConfig -UnifiedAuditLogIngestionEnabled `$true"
+}
+
+# Check per-mailbox audit state
+$mbxAudit = Get-Mailbox -Identity $Mailbox -ErrorAction Stop
+if (-not $mbxAudit.AuditEnabled) {
+    Write-Warning "Mailbox-level auditing is DISABLED for $Mailbox."
+    Write-Warning "Future changes will not be logged. Enable with:"
+    Write-Warning "  Set-Mailbox -Identity '$Mailbox' -AuditEnabled `$true"
+}
+
+# Resolve email to Azure AD Object ID
+# GUI-originated changes (EAC) log the mailbox as a GUID, not the email address.
+# Searching by email alone silently misses those records.
+$objectId = $mbxAudit.ExternalDirectoryObjectId
+Write-Output ""
+Write-Output "Mailbox      : $Mailbox"
+Write-Output "Object ID    : $objectId"
+Write-Output "Audit enabled: $($mbxAudit.AuditEnabled)"
+
+#endregion
+
+#region --- Audit Log Search ---
+
+$startDate = (Get-Date).AddDays(-$DaysBack)
+$endDate   = Get-Date
+
+Write-Output "Date range   : $($startDate.ToString('yyyy-MM-dd')) to $($endDate.ToString('yyyy-MM-dd'))"
+Write-Output ""
+Write-Output "Searching audit log — this may take a moment..."
+Write-Output ""
+
+$forwardingParams = @(
+    'ForwardingAddress',
+    'ForwardingSmtpAddress',
+    'DeliverToMailboxAndForward'
+)
+
+# Pass 1: Search by Object ID — catches EAC/GUI-originated changes
+Write-Output "[1/2] Searching by Object ID (catches EAC/GUI changes)..."
+$searchByGuid = @(Search-UnifiedAuditLog `
+    -StartDate  $startDate `
+    -EndDate    $endDate `
+    -RecordType ExchangeAdmin `
+    -FreeText   $objectId `
+    -ResultSize 500 `
+    -ErrorAction SilentlyContinue)
+Write-Output "[1/2] Done — $($searchByGuid.Count) records returned"
+Write-Output ""
+
+# Pass 2: Search by email — catches PowerShell-originated changes
+Write-Output "[2/2] Searching by email address (catches PowerShell changes)..."
+$searchByEmail = @(Search-UnifiedAuditLog `
+    -StartDate  $startDate `
+    -EndDate    $endDate `
+    -RecordType ExchangeAdmin `
+    -FreeText   $Mailbox `
+    -ResultSize 500 `
+    -ErrorAction SilentlyContinue)
+Write-Output "[2/2] Done — $($searchByEmail.Count) records returned"
+Write-Output ""
+
+# Combine and deduplicate
+Write-Output "Deduplicating and filtering for forwarding parameters..."
+$allResults = @($searchByGuid) + @($searchByEmail) |
+    Sort-Object -Property Identity -Unique
+
+Write-Output "Records returned  : $($allResults.Count) total (before forwarding filter)"
+Write-Output ""
+
+#endregion
+
+#region --- Filter and Parse ---
+
+$forwardingChanges = foreach ($entry in $allResults) {
+    try {
+        $data = $entry.AuditData | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        continue
+    }
+
+    $fwdParams = $data.Parameters | Where-Object {
+        $_.Name -in $forwardingParams
+    }
+
+    if (-not $fwdParams) { continue }
+
+    # Resolve GUID-format ForwardingAddress to a display name if possible
+    $resolvedForwarding = foreach ($p in $fwdParams) {
+        $val = $p.Value
+        if ($p.Name -eq 'ForwardingAddress' -and $val -match '^[0-9a-f\-]{36}$') {
+            try {
+                $recipient = Get-Recipient -Identity $val -ErrorAction Stop
+                $val = "$($recipient.DisplayName) <$($recipient.PrimarySmtpAddress)>"
+            } catch {
+                $val = "$val (could not resolve)"
+            }
+        }
+        "$($p.Name) = $val"
+    }
+
+    [PSCustomObject]@{
+        Date             = $entry.CreationDate
+        PerformedBy      = $data.UserId
+        ClientIP         = $data.ClientIP
+        Operation        = $entry.Operations
+        Mailbox          = $Mailbox
+        ParameterChanged = $resolvedForwarding -join ' | '
+        ResultStatus     = $data.ResultStatus
+        Source           = if ($entry.Identity -in $searchByGuid.Identity) { 'GUI/EAC' } else { 'PowerShell' }
+    }
+}
+
+#endregion
+
+#region --- Output ---
+
+if ($forwardingChanges) {
+    Write-Output "=== FORWARDING CHANGES FOUND ==="
+    Write-Output ""
+
+    foreach ($change in ($forwardingChanges | Sort-Object Date)) {
+        Write-Output "Date         : $($change.Date)"
+        Write-Output "Performed By : $($change.PerformedBy)"
+        Write-Output "Client IP    : $(($change.ClientIP -split ':')[0])"
+        Write-Output "Operation    : $($change.Operation)"
+        Write-Output "Source       : $($change.Source)"
+        Write-Output "Changes      :"
+        foreach ($param in ($change.ParameterChanged -split ' \| ')) {
+            Write-Output "               $param"
+        }
+        Write-Output ('-' * 60)
+    }
+
+    if ($OutputCsv) {
+        $csvDir = Split-Path -Path $OutputCsv -Parent
+        if ($csvDir -and -not (Test-Path $csvDir)) {
+            New-Item -ItemType Directory -Path $csvDir -Force | Out-Null
+        }
+        $forwardingChanges |
+            Sort-Object Date |
+            Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
+        Write-Output "CSV exported: $OutputCsv"
+    }
+} else {
+    Write-Output "No forwarding changes found in the audit log for $Mailbox"
+    Write-Output ""
+    Write-Output "Possible reasons:"
+    Write-Output "  - The change was made before the $DaysBack-day search window"
+    Write-Output "  - Mailbox auditing was not enabled when the change occurred"
+    Write-Output "  - The mailbox does not have E5 licensing (limits audit retention to 90 days)"
+    Write-Output "  - The change was made via Outlook desktop client (not always logged)"
+}
+
+#endregion
+
+#region --- Cleanup ---
+if ($newConnection) {
+    Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue
+}
+#endregion
